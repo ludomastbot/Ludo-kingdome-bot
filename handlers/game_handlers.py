@@ -91,6 +91,7 @@ async def create_game_lobby(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
 
 
+
 async def join_color_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle join color button clicks"""
     try:
@@ -129,30 +130,43 @@ async def join_color_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             updated_message = format_join_board_message(game_info, game.game_type)
             keyboard = create_join_keyboard(game_code)
             
-            await query.edit_message_text(
-                updated_message,
-                parse_mode='Markdown',
-                reply_markup=keyboard
-            )
+            try:
+                await query.edit_message_text(
+                    updated_message,
+                    parse_mode=None,  # Markdown band karein
+                    reply_markup=keyboard
+                )
+                await query.answer(f"✅ Joined as {color.title()}!")
+            except Exception as edit_error:
+                # Agar message same hai to simple message show karein
+                if "not modified" in str(edit_error).lower():
+                    await query.answer("You're already in this game!", show_alert=True)
+                else:
+                    # Try without markdown
+                    await query.edit_message_text(
+                        updated_message,
+                        parse_mode=None,
+                        reply_markup=keyboard
+                    )
             
             # Update active games storage
-            active_games[game_code] = {
-                'message_id': query.message.message_id,
-                'chat_id': query.message.chat_id,
-                'players': game_info['players']
-            }
-            
-            # Notify user
-            await query.answer(f"✅ Joined as {color.title()}!", show_alert=False)
+            if game_code in active_games:
+                active_games[game_code]['players'] = game_info['players']
         else:
-            await query.answer(f"❌ {message}", show_alert=True)
+            await query.answer(message, show_alert=True)
         
         user_service.close()
         game_service.close()
         
     except Exception as e:
         logger.error(f"Error in join_color_handler: {e}")
-        await query.answer("❌ Error joining game.", show_alert=True)
+        if "not modified" in str(e).lower():
+            await query.answer("You're already in this game!", show_alert=True)
+        else:
+            await query.answer("❌ Error joining game.", show_alert=True)
+
+
+
 
 async def begin_game_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /begin command - start the game"""

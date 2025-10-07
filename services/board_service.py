@@ -31,6 +31,9 @@ class BoardService:
             if not game:
                 return None, "Game not found"
             
+            if game.status != 'active':
+                return None, "Game not started or finished"
+            
             # Check if it's user's turn
             current_player = self._get_current_player(game)
             if not current_player or current_player.user_id != user_id:
@@ -55,6 +58,9 @@ class BoardService:
     
     def _get_current_player(self, game: Game):
         """Get current player based on turn order"""
+        if game.status != 'active':
+            return None
+            
         players = self.db.query(GamePlayer).filter(
             GamePlayer.game_id == game.id
         ).order_by(GamePlayer.player_order).all()
@@ -112,19 +118,33 @@ class BoardService:
         start, end = color_ranges.get(color, (0, 0))
         if start <= current_position < end:
             # In home stretch, can only move forward
-            return min(new_position, end)
+            return min(new_position, 57)  # Max 57 is finish
+        
+        # Handle board wrapping (52 positions total)
+        if new_position > 52:
+            new_position = new_position - 52
         
         return new_position
     
     def _is_capture_move(self, current_position: int, dice_value: int, color: str, game: Game):
         """Check if move will capture opponent's piece"""
+        if current_position == 0:  # Can't capture from home
+            return False
+            
         new_position = self._calculate_new_position(current_position, dice_value, color)
         
-        # Check if new position has opponent's piece
-        board_state = game.board_state
-        if new_position in board_state.get('board_positions', []):
-            occupying_color = board_state['board_positions'][new_position - 1]
-            return occupying_color and occupying_color != color
+        # Check all opponent pieces at new position
+        players = self.db.query(GamePlayer).filter(
+            GamePlayer.game_id == game.id,
+            GamePlayer.color != color
+        ).all()
+        
+        for player in players:
+            if new_position in player.pieces_position:
+                # Check if it's not a safe position
+                safe_positions = [1, 9, 14, 22, 27, 35, 40, 48]  # Starting positions are safe
+                if new_position not in safe_positions:
+                    return True
         
         return False
     
@@ -162,18 +182,20 @@ class BoardService:
             # Check for win condition
             if self._check_win_condition(current_player):
                 game.status = 'finished'
+                self.db.commit()
                 return True, "You won the game! 🎉"
             
             # Move to next turn if not 6
             if game.dice_value != 6:
                 game.current_turn += 1
-                if game.current_turn > game.current_players:
+                players_count = len(self.db.query(GamePlayer).filter(GamePlayer.game_id == game.id).all())
+                if game.current_turn > players_count:
                     game.current_turn = 1
             
             game.dice_value = 0  # Reset dice
             self.db.commit()
             
-            return True, "Move executed successfully"
+            return True, f"Moved piece to position {move_to_execute['new_position']}"
             
         except Exception as e:
             self.db.rollback()
@@ -190,51 +212,34 @@ class BoardService:
         pieces_position[move['piece_index']] = new_position
         player.pieces_position = pieces_position
         
-        # Update board state
-        board_state = game.board_state
-        
-        # Remove from old position
-        if old_position > 0:  # Not home
-            board_positions = board_state.get('board_positions', [])
-            if len(board_positions) >= old_position:
-                board_positions[old_position - 1] = None
-        
-        # Add to new position  
-        if new_position > 0:  # Not home
-            board_positions = board_state.get('board_positions', [])
-            # Ensure board_positions list is long enough
-            while len(board_positions) < new_position:
-                board_positions.append(None)
-            board_positions[new_position - 1] = player.color
-        
-        board_state['board_positions'] = board_positions
-        game.board_state = board_state
-        
         # Handle capture
         if move['is_capture']:
             self._handle_capture(game, new_position, player.color)
     
     def _handle_capture(self, game: Game, position: int, capturing_color: str):
-        """Handle piece capture"""
-        # Find player whose piece was captured
-        players = self.db.query(GamePlayer).filter(GamePlayer.game_id == game.id).all()
-        
-        for player in players:
-            if player.color == capturing_color:
-                continue  # Skip capturing player
+        """Handle piece capture - send opponent's piece back to home"""
+        try:
+            # Find opponent players
+            opponents = self.db.query(GamePlayer).filter(
+                GamePlayer.game_id == game.id,
+                GamePlayer.color != capturing_color
+            ).all()
             
-            pieces = player.pieces_position
-            for i, piece_pos in enumerate(pieces):
-                if piece_pos == position:
-                    # Send piece back to home
-                    pieces[i] = 0
-                    player.pieces_position = pieces
-                    logger.info(f"Piece captured: {player.color} piece at position {position}")
-                    break
+            for opponent in opponents:
+                pieces = opponent.pieces_position
+                for i, piece_pos in enumerate(pieces):
+                    if piece_pos == position:
+                        # Send piece back to home
+                        pieces[i] = 0
+                        opponent.pieces_position = pieces
+                        logger.info(f"Piece captured: {opponent.color} piece at position {position}")
+                        break
+                        
+        except Exception as e:
+            logger.error(f"Error handling capture: {e}")
     
     def _check_win_condition(self, player: GamePlayer):
-        """Check if player has won"""
-        # Player wins when all pieces are at finish (position 57)
+        """Check if player has won - all pieces at finish"""
         return all(pos == 57 for pos in player.pieces_position)
     
     def get_game_status(self, game_code: str):

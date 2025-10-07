@@ -8,8 +8,14 @@ from database.models import init_db
 from handlers.start_handler import start_handler, help_handler
 from handlers.stats_handler import stats_handler, leaderboard_group_handler, leaderboard_global_handler
 from handlers.game_handlers import (
-    play_handler, ludotwo_handler, ludothree_handler, ludofour_handler, 
-    join_color_handler, begin_game_handler
+    play_handler, ludotwo_handler, ludothree_handler, ludofour_handler,
+    join_color_handler
+)
+from handlers.gameplay_handlers import (
+    begin_game_handler, roll_dice_handler, move_piece_handler
+)
+from handlers.bot_game_handlers import (
+    ludotwobot_handler, ludo_two_two_handler
 )
 
 class LudoBot:
@@ -53,8 +59,14 @@ class LudoBot:
         self.application.add_handler(CommandHandler("ludofour", ludofour_handler))
         self.application.add_handler(CommandHandler("begin", begin_game_handler))
         
+        # Bot game commands - NAYE COMMANDS
+        self.application.add_handler(CommandHandler("ludotwobot", ludotwobot_handler))
+        self.application.add_handler(CommandHandler("ludo_two_two", ludo_two_two_handler))
+        
         # Callback handlers for buttons
         self.application.add_handler(CallbackQueryHandler(join_color_handler, pattern="^join_"))
+        self.application.add_handler(CallbackQueryHandler(roll_dice_handler, pattern="^roll_"))
+        self.application.add_handler(CallbackQueryHandler(move_piece_handler, pattern="^move_"))
         
         # Add more handlers here as we build them
         

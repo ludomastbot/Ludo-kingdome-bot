@@ -1,279 +1,260 @@
-import os
-import sys
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from sqlalchemy.orm import Session
 import random
-from database.models import Game, GamePlayer, SessionLocal
+from typing import Dict, List, Tuple
 from utils.logger import logger
 
 class BoardService:
     def __init__(self):
-        self.db = SessionLocal()
-    
-    def get_board_state(self, game_code: str):
-        """Get current board state for a game"""
-        try:
-            game = self.db.query(Game).filter(Game.game_code == game_code).first()
-            if not game:
-                return None
-            
-            return game.board_state
-            
-        except Exception as e:
-            logger.error(f"Error getting board state: {e}")
-            return None
-    
-    def roll_dice(self, game_code: str, user_id: int):
-        """Roll dice for a player's turn"""
-        try:
-            game = self.db.query(Game).filter(Game.game_code == game_code).first()
-            if not game:
-                return None, "Game not found"
-            
-            if game.status != 'active':
-                return None, "Game not started or finished"
-            
-            # Check if it's user's turn
-            current_player = self._get_current_player(game)
-            if not current_player or current_player.user_id != user_id:
-                return None, "Not your turn"
-            
-            # Roll dice (1-6)
-            dice_value = random.randint(1, 6)
-            game.dice_value = dice_value
-            
-            # Get possible moves
-            possible_moves = self._get_possible_moves(game, current_player, dice_value)
-            
-            self.db.commit()
-            
-            logger.info(f"User {user_id} rolled {dice_value} in game {game_code}")
-            return dice_value, possible_moves
-            
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"Error rolling dice: {e}")
-            return None, str(e)
-    
-    def _get_current_player(self, game: Game):
-        """Get current player based on turn order"""
-        if game.status != 'active':
-            return None
-            
-        players = self.db.query(GamePlayer).filter(
-            GamePlayer.game_id == game.id
-        ).order_by(GamePlayer.player_order).all()
-        
-        if not players:
-            return None
-        
-        current_index = (game.current_turn - 1) % len(players)
-        return players[current_index]
-    
-    def _get_possible_moves(self, game: Game, player: GamePlayer, dice_value: int):
-        """Get possible moves for a player"""
-        possible_moves = []
-        pieces_position = player.pieces_position
-        
-        for i, position in enumerate(pieces_position):
-            if self._is_valid_move(position, dice_value, player.color):
-                possible_moves.append({
-                    'piece_index': i,
-                    'current_position': position,
-                    'new_position': self._calculate_new_position(position, dice_value, player.color),
-                    'is_capture': self._is_capture_move(position, dice_value, player.color, game)
-                })
-        
-        return possible_moves
-    
-    def _is_valid_move(self, current_position: int, dice_value: int, color: str):
-        """Check if move is valid"""
-        # Piece at home, need 6 to start
-        if current_position == 0:
-            return dice_value == 6
-        
-        # Piece on board, check if move is within bounds
-        new_position = self._calculate_new_position(current_position, dice_value, color)
-        return new_position <= 57  # 57 is finish position
-    
-    def _calculate_new_position(self, current_position: int, dice_value: int, color: str):
-        """Calculate new position after move"""
-        if current_position == 0:  # At home
-            # Starting positions for each color
-            start_positions = {'red': 1, 'blue': 14, 'green': 27, 'yellow': 40}
-            return start_positions.get(color, 1)
-        
-        # Normal move on board
-        new_position = current_position + dice_value
-        
-        # Handle home stretch for each color
-        color_ranges = {
-            'red': (52, 57),    # Positions 52-57 are red home stretch
-            'blue': (13, 18),   # Positions 13-18 are blue home stretch  
-            'green': (26, 31),  # Positions 26-31 are green home stretch
-            'yellow': (39, 44)  # Positions 39-44 are yellow home stretch
+        self.board_size = 15  # 15x15 grid
+        self.colors = ['red', 'blue', 'green', 'yellow']
+        self.color_emojis = {
+            'red': '🔴',
+            'blue': '🔵', 
+            'green': '🟢',
+            'yellow': '🟡'
         }
         
-        start, end = color_ranges.get(color, (0, 0))
-        if start <= current_position < end:
-            # In home stretch, can only move forward
-            return min(new_position, 57)  # Max 57 is finish
-        
-        # Handle board wrapping (52 positions total)
-        if new_position > 52:
-            new_position = new_position - 52
-        
-        return new_position
+        # Initialize board paths
+        self._initialize_paths()
     
-    def _is_capture_move(self, current_position: int, dice_value: int, color: str, game: Game):
-        """Check if move will capture opponent's piece"""
-        if current_position == 0:  # Can't capture from home
-            return False
-            
-        new_position = self._calculate_new_position(current_position, dice_value, color)
+    def _initialize_paths(self):
+        """Initialize proper Ludo board paths"""
+        # Home positions (start areas)
+        self.home_positions = {
+            'red': [(1, 1), (1, 2), (2, 1), (2, 2)],
+            'blue': [(1, 12), (1, 13), (2, 12), (2, 13)],
+            'green': [(12, 1), (12, 2), (13, 1), (13, 2)],
+            'yellow': [(12, 12), (12, 13), (13, 12), (13, 13)]
+        }
         
-        # Check all opponent pieces at new position
-        players = self.db.query(GamePlayer).filter(
-            GamePlayer.game_id == game.id,
-            GamePlayer.color != color
-        ).all()
+        # Main board path (circular path)
+        self.main_path = self._create_main_path()
         
-        for player in players:
-            if new_position in player.pieces_position:
-                # Check if it's not a safe position
-                safe_positions = [1, 9, 14, 22, 27, 35, 40, 48]  # Starting positions are safe
-                if new_position not in safe_positions:
-                    return True
+        # Starting positions
+        self.start_positions = {
+            'red': (6, 1),
+            'blue': (1, 8), 
+            'green': (8, 13),
+            'yellow': (13, 6)
+        }
         
-        return False
+        # Home paths (winning paths)
+        self.home_paths = {
+            'red': [(6, 2), (6, 3), (6, 4), (6, 5), (6, 6), (7, 6)],
+            'blue': [(2, 8), (3, 8), (4, 8), (5, 8), (6, 8), (6, 7)],
+            'green': [(8, 12), (8, 11), (8, 10), (8, 9), (8, 8), (7, 8)],
+            'yellow': [(12, 6), (11, 6), (10, 6), (9, 6), (8, 6), (8, 7)]
+        }
     
-    def move_piece(self, game_code: str, user_id: int, piece_index: int):
-        """Move a piece on the board"""
+    def _create_main_path(self) -> List[Tuple[int, int]]:
+        """Create the main circular path for Ludo board"""
+        path = []
+        
+        # Red to Blue (top)
+        for col in range(2, 8):
+            path.append((1, col))
+        
+        # Blue to Green (right)  
+        for row in range(2, 8):
+            path.append((row, 13))
+        
+        # Green to Yellow (bottom)
+        for col in range(12, 6, -1):
+            path.append((13, col))
+        
+        # Yellow to Red (left)
+        for row in range(12, 6, -1):
+            path.append((row, 1))
+        
+        return path
+    
+    def create_visual_board(self, game_state: Dict) -> str:
+        """Create proper visual Ludo board"""
         try:
-            game = self.db.query(Game).filter(Game.game_code == game_code).first()
-            if not game:
-                return False, "Game not found"
+            # Create empty board grid
+            board = [['⬜' for _ in range(15)] for _ in range(15)]
             
-            # Check if it's user's turn
-            current_player = self._get_current_player(game)
-            if not current_player or current_player.user_id != user_id:
-                return False, "Not your turn"
+            # Draw main path
+            for row, col in self.main_path:
+                if 0 <= row < 15 and 0 <= col < 15:
+                    board[row][col] = '⬛'
             
-            # Check if dice was rolled
-            if game.dice_value == 0:
-                return False, "Roll dice first"
+            # Draw colored home areas
+            for color, positions in self.home_positions.items():
+                for row, col in positions:
+                    if color == 'red':
+                        board[row][col] = '🟥'
+                    elif color == 'blue':
+                        board[row][col] = '🟦' 
+                    elif color == 'green':
+                        board[row][col] = '🟩'
+                    elif color == 'yellow':
+                        board[row][col] = '🟨'
             
-            # Get possible moves
-            possible_moves = self._get_possible_moves(game, current_player, game.dice_value)
-            move_to_execute = None
+            # Draw home paths
+            for color, path in self.home_paths.items():
+                for row, col in path:
+                    if color == 'red':
+                        board[row][col] = '🟥'
+                    elif color == 'blue':
+                        board[row][col] = '🟦'
+                    elif color == 'green':
+                        board[row][col] = '🟩'
+                    elif color == 'yellow':
+                        board[row][col] = '🟨'
             
-            for move in possible_moves:
-                if move['piece_index'] == piece_index:
-                    move_to_execute = move
-                    break
+            # Draw center star
+            for row in range(6, 9):
+                for col in range(6, 9):
+                    board[row][col] = '⭐'
             
-            if not move_to_execute:
-                return False, "Invalid move"
+            # Place tokens on board
+            if 'players' in game_state:
+                for player in game_state['players']:
+                    color = player['color']
+                    tokens = player.get('tokens', [-1, -1, -1, -1])
+                    
+                    for i, token_pos in enumerate(tokens):
+                        if token_pos >= 0:  # Token on board
+                            row, col = self._get_board_position(color, token_pos)
+                            if 0 <= row < 15 and 0 <= col < 15:
+                                board[row][col] = self.color_emojis[color]
             
-            # Execute the move
-            self._execute_move(game, current_player, move_to_execute)
+            # Convert board to string
+            board_text = "🎲 *LUDO GAME BOARD* 🎲\n\n"
             
-            # Check for win condition
-            if self._check_win_condition(current_player):
-                game.status = 'finished'
-                self.db.commit()
-                return True, "You won the game! 🎉"
+            # Add column numbers
+            board_text += "   "
+            for col in range(15):
+                board_text += f"{col:2d}"
+            board_text += "\n"
             
-            # Move to next turn if not 6
-            if game.dice_value != 6:
-                game.current_turn += 1
-                players_count = len(self.db.query(GamePlayer).filter(GamePlayer.game_id == game.id).all())
-                if game.current_turn > players_count:
-                    game.current_turn = 1
+            # Add board with row numbers
+            for row in range(15):
+                board_text += f"{row:2d} "
+                for col in range(15):
+                    board_text += board[row][col]
+                board_text += f" {row:2d}\n"
             
-            game.dice_value = 0  # Reset dice
-            self.db.commit()
+            # Add column numbers at bottom
+            board_text += "   "
+            for col in range(15):
+                board_text += f"{col:2d}"
+            board_text += "\n\n"
             
-            return True, f"Moved piece to position {move_to_execute['new_position']}"
+            # Add player status
+            board_text += self._get_player_status(game_state)
+            
+            return board_text
             
         except Exception as e:
-            self.db.rollback()
-            logger.error(f"Error moving piece: {e}")
-            return False, str(e)
+            logger.error(f"Error creating visual board: {e}")
+            return self.create_simple_board(game_state)
     
-    def _execute_move(self, game: Game, player: GamePlayer, move: dict):
-        """Execute a move on the board"""
-        pieces_position = player.pieces_position
-        old_position = pieces_position[move['piece_index']]
-        new_position = move['new_position']
+    def _get_board_position(self, color: str, position: int) -> Tuple[int, int]:
+        """Get board coordinates for token position"""
+        if position < 0:  # In home
+            return (-1, -1)
         
-        # Update piece position
-        pieces_position[move['piece_index']] = new_position
-        player.pieces_position = pieces_position
+        # Main path positions (0-51)
+        if position < 52:
+            start_idx = {'red': 0, 'blue': 13, 'green': 26, 'yellow': 39}[color]
+            actual_idx = (start_idx + position) % 52
+            return self.main_path[actual_idx]
         
-        # Handle capture
-        if move['is_capture']:
-            self._handle_capture(game, new_position, player.color)
+        # Home path positions (52-57)
+        elif position < 58:
+            home_path_idx = position - 52
+            if home_path_idx < len(self.home_paths[color]):
+                return self.home_paths[color][home_path_idx]
+        
+        return (-1, -1)
     
-    def _handle_capture(self, game: Game, position: int, capturing_color: str):
-        """Handle piece capture - send opponent's piece back to home"""
+    def _get_player_status(self, game_state: Dict) -> str:
+        """Get player status text"""
+        status_text = ""
+        
+        if 'players' in game_state:
+            for player in game_state['players']:
+                color = player['color']
+                tokens = player.get('tokens', [-1, -1, -1, -1])
+                
+                tokens_home = sum(1 for pos in tokens if pos == -1)
+                tokens_board = sum(1 for pos in tokens if 0 <= pos < 52)
+                tokens_home_path = sum(1 for pos in tokens if 52 <= pos < 57)
+                tokens_finished = sum(1 for pos in tokens if pos == 57)
+                
+                player_type = "👤 Human" if player.get('user_id', 0) > 0 else "🤖 Bot"
+                
+                status_text += (
+                    f"{self.color_emojis[color]} {color.title()} ({player_type}):\n"
+                    f"   🏠 Home: {tokens_home} | 🎯 Board: {tokens_board} | "
+                    f"🛣️ Path: {tokens_home_path} | ✅ Finished: {tokens_finished}\n\n"
+                )
+        
+        # Add game status
+        if 'status' in game_state:
+            status_text += f"🎮 Status: {game_state['status'].title()}\n"
+        
+        # Add current turn
+        if 'current_player' in game_state:
+            current_color = game_state['current_player']
+            player_type = "👤 Your turn" if game_state.get('is_user_turn', False) else "🤖 Bot's turn"
+            status_text += f"🎯 Current Turn: {player_type} ({current_color.title()})\n"
+        
+        # Add dice value
+        if 'dice_value' in game_state and game_state['dice_value'] > 0:
+            dice_emojis = {1: "⚀", 2: "⚁", 3: "⚂", 4: "⚃", 5: "⚄", 6: "⚅"}
+            dice_emoji = dice_emojis.get(game_state['dice_value'], "🎲")
+            status_text += f"🎲 Last Dice: {dice_emoji} {game_state['dice_value']}\n"
+        
+        return status_text
+    
+    def create_simple_board(self, game_state: Dict) -> str:
+        """Create simple board when visual fails"""
         try:
-            # Find opponent players
-            opponents = self.db.query(GamePlayer).filter(
-                GamePlayer.game_id == game.id,
-                GamePlayer.color != capturing_color
-            ).all()
+            board_text = "🎲 *LUDO GAME* 🎲\n\n"
             
-            for opponent in opponents:
-                pieces = opponent.pieces_position
-                for i, piece_pos in enumerate(pieces):
-                    if piece_pos == position:
-                        # Send piece back to home
-                        pieces[i] = 0
-                        opponent.pieces_position = pieces
-                        logger.info(f"Piece captured: {opponent.color} piece at position {position}")
-                        break
+            if 'players' in game_state:
+                for player in game_state['players']:
+                    color = player['color']
+                    tokens = player.get('tokens', [-1, -1, -1, -1])
+                    
+                    player_type = "👤 Human" if player.get('user_id', 0) > 0 else "🤖 Bot"
+                    board_text += f"{self.color_emojis[color]} {color.title()} ({player_type}):\n"
+                    
+                    for i, pos in enumerate(tokens):
+                        if pos == -1:
+                            status = "🏠 Home"
+                        elif pos == 57:
+                            status = "✅ Finished"
+                        elif pos >= 52:
+                            status = f"🛣️ Path ({pos-51}/6)"
+                        else:
+                            status = f"🎯 Position {pos+1}"
                         
-        except Exception as e:
-            logger.error(f"Error handling capture: {e}")
-    
-    def _check_win_condition(self, player: GamePlayer):
-        """Check if player has won - all pieces at finish"""
-        return all(pos == 57 for pos in player.pieces_position)
-    
-    def get_game_status(self, game_code: str):
-        """Get complete game status"""
-        try:
-            game = self.db.query(Game).filter(Game.game_code == game_code).first()
-            if not game:
-                return None
+                        board_text += f"   Token {i+1}: {status}\n"
+                    
+                    board_text += "\n"
             
-            players = self.db.query(GamePlayer).filter(GamePlayer.game_id == game.id).all()
-            current_player = self._get_current_player(game)
+            # Add game info
+            if 'status' in game_state:
+                board_text += f"🎮 Status: {game_state['status'].title()}\n"
             
-            return {
-                'game_code': game.game_code,
-                'status': game.status,
-                'current_turn': game.current_turn,
-                'dice_value': game.dice_value,
-                'current_player': current_player.user_id if current_player else None,
-                'players': [
-                    {
-                        'user_id': p.user_id,
-                        'color': p.color,
-                        'pieces_position': p.pieces_position,
-                        'player_order': p.player_order
-                    }
-                    for p in players
-                ],
-                'board_state': game.board_state
-            }
+            if 'current_player' in game_state:
+                current_color = game_state['current_player']
+                player_type = "👤 Your turn" if game_state.get('is_user_turn', False) else "🤖 Bot's turn"
+                board_text += f"🎯 Current Turn: {player_type} ({current_color.title()})\n"
+            
+            if 'dice_value' in game_state and game_state['dice_value'] > 0:
+                dice_emojis = {1: "⚀", 2: "⚁", 3: "⚂", 4: "⚃", 5: "⚄", 6: "⚅"}
+                dice_emoji = dice_emojis.get(game_state['dice_value'], "🎲")
+                board_text += f"🎲 Last Dice: {dice_emoji} {game_state['dice_value']}\n"
+            
+            return board_text
             
         except Exception as e:
-            logger.error(f"Error getting game status: {e}")
-            return None
-    
-    def close(self):
-        """Close database connection"""
-        self.db.close()
+            logger.error(f"Error creating simple board: {e}")
+            return "🎲 Ludo Game - Board loading...\n\nUse /board to refresh"
+
+# Singleton instance
+board_service = BoardService()

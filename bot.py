@@ -1,807 +1,435 @@
-#!/usr/bin/env python3
 import os
-import logging
-import sqlite3
 import random
-import json
 import asyncio
-from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackContext, CallbackQueryHandler, MessageHandler, filters
-from flask import Flask, request
-import threading
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-# Configure logging
-logging.basicConfig(
-    format='%(asctime)s - LUDO BOT - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-
-# Bot Token
-BOT_TOKEN = os.environ.get('BOT_TOKEN', '8403232282:AAGXrSzIciS5aEQSUJMs-iZ82LuTtEGBa8o')
-
-# Flask app for web server
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return "🎲 Ludo Bot is Running!"
-
-@app.route('/ping')
-def ping():
-    return "pong"
-
-# Database setup
-def init_db():
-    conn = sqlite3.connect('ludo_bot.db')
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
-            games_played INTEGER DEFAULT 0,
-            games_won INTEGER DEFAULT 0,
-            total_coins INTEGER DEFAULT 1000,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS game_sessions (
-            session_id TEXT PRIMARY KEY,
-            players TEXT,
-            game_state TEXT,
-            status TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    conn.commit()
-    conn.close()
-
-init_db()
-
-
+TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8403232282:AAGXrSzIciS5aEQSUJMs-iZ82LuTtEGBa8o')
 
 class LudoGame:
-    def __init__(self, players):
-        self.players = players  # {user_id: {'color': 'red', 'name': 'Player1', 'tokens': [0,0,0,0]}}
-        self.colors = ['red', 'blue', 'green', 'yellow']
-        self.current_player_index = 0
+    def __init__(self, chat_id, players, is_bot_game=False):
+        self.chat_id = chat_id
+        self.players = players
+        self.is_bot_game = is_bot_game
+        self.current_turn = 0
         self.dice_value = 0
-        self.game_state = "waiting"
-        self.board = self.initialize_board()
+        self.winner = None
+        self.last_roll_was_six = False
         
-    def initialize_board(self):
-        # Simple board representation
-        return {
-            'red': {'tokens': [-1, -1, -1, -1], 'home': 0, 'path': list(range(1, 57))},
-            'blue': {'tokens': [-1, -1, -1, -1], 'home': 14, 'path': list(range(15, 57)) + list(range(1, 15))},
-            'green': {'tokens': [-1, -1, -1, -1], 'home': 28, 'path': list(range(29, 57)) + list(range(1, 29))},
-            'yellow': {'tokens': [-1, -1, -1, -1], 'home': 42, 'path': list(range(43, 57)) + list(range(1, 43))}
+        # Initialize positions: -1 means in home, 0-51 on board, 52+ finished
+        self.positions = {}
+        for player in players:
+            self.positions[player] = [-1, -1, -1, -1]
+        
+        # Player colors
+        self.colors = {
+            players[0]: '🔴',
+            players[1]: '🟢' if len(players) > 1 else '',
+            players[2]: '🟡' if len(players) > 2 else '',
+            players[3]: '🔵' if len(players) > 3 else ''
         }
+        
+        # Starting positions for each player
+        self.start_pos = {
+            players[0]: 0,
+            players[1]: 13 if len(players) > 1 else 0,
+            players[2]: 26 if len(players) > 2 else 0,
+            players[3]: 39 if len(players) > 3 else 0
+        }
+        
+        # Safe spots where pieces can't be captured
+        self.safe_spots = [0, 8, 13, 21, 26, 34, 39, 47]
     
     def roll_dice(self):
         self.dice_value = random.randint(1, 6)
+        self.last_roll_was_six = (self.dice_value == 6)
         return self.dice_value
     
-    def can_move_token(self, player_color, token_index):
-        if self.dice_value == 6 and self.board[player_color]['tokens'][token_index] == -1:
-            return True
-        elif self.board[player_color]['tokens'][token_index] >= 0:
-            return True
-        return False
+    def get_current_player(self):
+        return self.players[self.current_turn]
     
-    def move_token(self, player_color, token_index):
-        current_pos = self.board[player_color]['tokens'][token_index]
-        
-        if current_pos == -1 and self.dice_value == 6:
-            # Move token out of home
-            self.board[player_color]['tokens'][token_index] = self.board[player_color]['home']
-        elif current_pos >= 0:
-            # Move token on board
-            new_pos = (current_pos + self.dice_value) % 56
-            self.board[player_color]['tokens'][token_index] = new_pos
-            
-            # Check if token captures opponent
-            self.capture_tokens(player_color, new_pos)
-        
-        # Check for extra turn
-        if self.dice_value == 6:
-            return True  # Extra turn
-        return False
+    def can_move_out(self):
+        return self.dice_value == 6
     
-    def capture_tokens(self, player_color, position):
-        for color in self.colors:
-            if color != player_color:
-                for i in range(4):
-                    if self.board[color]['tokens'][i] == position:
-                        self.board[color]['tokens'][i] = -1  # Send back to home
+    def get_movable_pieces(self, player):
+        movable = []
+        positions = self.positions[player]
+        
+        for i, pos in enumerate(positions):
+            # Piece in home - can only move out with 6
+            if pos == -1:
+                if self.dice_value == 6:
+                    movable.append(i)
+            # Piece on board - check if can move
+            elif pos >= 0 and pos < 51:
+                new_pos = pos + self.dice_value
+                # Can't move past finish
+                if new_pos <= 56:  # Home stretch is 51-56
+                    movable.append(i)
+            # Piece in home stretch (51-56)
+            elif 51 <= pos < 56:
+                if pos + self.dice_value <= 56:
+                    movable.append(i)
+        
+        return movable
+    
+    def move_piece(self, player, piece_idx):
+        current_pos = self.positions[player][piece_idx]
+        
+        # Moving out from home
+        if current_pos == -1:
+            start = self.start_pos[player]
+            self.positions[player][piece_idx] = start
+            self.check_capture(player, start)
+            return True
+        
+        # Calculate new position
+        new_pos = current_pos + self.dice_value
+        
+        # Can't move past finish
+        if new_pos > 56:
+            return False
+        
+        self.positions[player][piece_idx] = new_pos
+        
+        # Check for capture (only if not in home stretch and not finished)
+        if new_pos < 51:
+            self.check_capture(player, new_pos)
+        
+        # Check win condition
+        self.check_win(player)
+        
+        return True
+    
+    def check_capture(self, moving_player, position):
+        # Can't capture on safe spots
+        if position in self.safe_spots:
+            return
+        
+        # Check all other players
+        for player in self.players:
+            if player != moving_player:
+                for i, pos in enumerate(self.positions[player]):
+                    if pos == position:
+                        # Send piece back home
+                        self.positions[player][i] = -1
+    
+    def check_win(self, player):
+        # Win if all pieces are at position 56 (finished)
+        if all(pos == 56 for pos in self.positions[player]):
+            self.winner = player
     
     def next_turn(self):
-        self.current_player_index = (self.current_player_index + 1) % len(self.players)
-        self.dice_value = 0
+        # Keep turn if rolled 6, otherwise move to next player
+        if not self.last_roll_was_six:
+            self.current_turn = (self.current_turn + 1) % len(self.players)
     
-    def get_current_player(self):
-        player_ids = list(self.players.keys())
-        return player_ids[self.current_player_index]
+    def get_board_display(self):
+        current_player = self.get_current_player()
+        text = f"🎲 *LUDO GAME*\n\n"
+        text += f"🎯 Turn: {self.colors[current_player]} {current_player}\n"
+        text += f"🎲 Dice: {self.dice_value if self.dice_value > 0 else '❓'}\n\n"
+        
+        for player in self.players:
+            text += f"{self.colors[player]} *{player}*\n"
+            positions = self.positions[player]
+            for i, pos in enumerate(positions):
+                if pos == -1:
+                    text += f"  🔹 Piece {i+1}: 🏠 Home\n"
+                elif pos == 56:
+                    text += f"  🔹 Piece {i+1}: 🏁 Finished\n"
+                elif pos > 51:
+                    text += f"  🔹 Piece {i+1}: 🎯 Home Stretch ({pos-51}/5)\n"
+                else:
+                    text += f"  🔹 Piece {i+1}: 📍 Position {pos}\n"
+            text += "\n"
+        
+        return text
     
-    def check_winner(self):
-        for user_id, player_data in self.players.items():
-            if all(pos >= 51 for pos in self.board[player_data['color']]['tokens']):
-                return user_id
-        return None
-
-
-
-class GameSessionManager:
-    def __init__(self):
-        self.active_games = {}
-        self.waiting_rooms = {}
-    
-    def create_waiting_room(self, creator_id, creator_name):
-        room_id = f"room_{creator_id}_{datetime.now().timestamp()}"
-        self.waiting_rooms[room_id] = {
-            'creator': creator_id,
-            'players': {creator_id: {'name': creator_name, 'color': 'red', 'ready': False}},
-            'created_at': datetime.now(),
-            'max_players': 4
-        }
-        return room_id
-    
-    def join_waiting_room(self, room_id, user_id, username, color):
-        if room_id in self.waiting_rooms:
-            room = self.waiting_rooms[room_id]
-            if len(room['players']) < room['max_players']:
-                room['players'][user_id] = {
-                    'name': username, 
-                    'color': color, 
-                    'ready': False
-                }
-                return True
-        return False
-    
-    def start_game(self, room_id):
-        if room_id in self.waiting_rooms:
-            room = self.waiting_rooms[room_id]
-            game_id = f"game_{room_id}"
+    def bot_make_move(self):
+        """Smart bot AI for making moves"""
+        movable = self.get_movable_pieces(self.get_current_player())
+        
+        if not movable:
+            return None
+        
+        # Smart decision making
+        best_move = None
+        best_score = -1000
+        
+        for piece_idx in movable:
+            score = 0
+            current_pos = self.positions[self.get_current_player()][piece_idx]
             
-            # Create game instance
-            game = LudoGame(room['players'])
-            self.active_games[game_id] = {
-                'game': game,
-                'players': room['players'],
-                'created_at': datetime.now()
-            }
+            if current_pos == -1:
+                # Moving out of home
+                new_pos = self.start_pos[self.get_current_player()]
+            else:
+                new_pos = current_pos + self.dice_value
             
-            # Remove waiting room
-            del self.waiting_rooms[room_id]
-            return game_id
-        return None
-    
-    def get_game(self, game_id):
-        return self.active_games.get(game_id)
-    
-    def get_waiting_room(self, room_id):
-        return self.waiting_rooms.get(room_id)
-
-game_manager = GameSessionManager()
-
-
-class AdvancedLudoBot:
-    def __init__(self, token):
-        self.token = token
-        self.application = Application.builder().token(token).build()
-        self.setup_handlers()
-    
-    def setup_handlers(self):
-        """Setup all command handlers"""
-        # Basic commands
-        self.application.add_handler(CommandHandler("start", self.start_command))
-        self.application.add_handler(CommandHandler("help", self.help_command))
-        self.application.add_handler(CommandHandler("ludo", self.ludo_start))
-        self.application.add_handler(CommandHandler("play", self.quick_play))
+            # Prioritize capturing opponent pieces
+            for player in self.players:
+                if player != self.get_current_player():
+                    for opp_pos in self.positions[player]:
+                        if opp_pos == new_pos and new_pos not in self.safe_spots:
+                            score += 200  # High priority for captures
+            
+            # Prefer moving pieces closer to finish
+            if current_pos >= 0:
+                score += new_pos * 2
+            
+            # Prefer moving pieces out of home
+            if current_pos == -1:
+                score += 100
+            
+            # Avoid positions where opponents can capture
+            risk = 0
+            for player in self.players:
+                if player != self.get_current_player():
+                    for opp_pos in self.positions[player]:
+                        if opp_pos >= 0 and abs(opp_pos - new_pos) <= 6:
+                            risk += 20
+            score -= risk
+            
+            if score > best_score:
+                best_score = score
+                best_move = piece_idx
         
-        # Game commands
-        self.application.add_handler(CommandHandler("roll", self.roll_dice))
-        self.application.add_handler(CommandHandler("board", self.show_board))
-        self.application.add_handler(CommandHandler("profile", self.profile_command))
-        self.application.add_handler(CommandHandler("leaderboard", self.leaderboard_command))
-        
-        # Callback handlers
-        self.application.add_handler(CallbackQueryHandler(self.button_handler))
-        
-        # Message handler for showing available commands
-        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.show_commands))
-    
-    def save_user(self, user):
-        """Save user to database"""
-        conn = sqlite3.connect('ludo_bot.db')
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            INSERT OR IGNORE INTO users 
-            (user_id, username, first_name, total_coins)
-            VALUES (?, ?, ?, 1000)
-        ''', (user.id, user.username, user.first_name))
-        
-        cursor.execute('''
-            UPDATE users SET username = ?, first_name = ? 
-            WHERE user_id = ?
-        ''', (user.username, user.first_name, user.id))
-        
-        conn.commit()
-        conn.close()
+        return best_move
 
-    async def start_command(self, update: Update, context: CallbackContext):
-        """Advanced start command with interactive menu"""
-        user = update.effective_user
-        self.save_user(user)
-        
-        keyboard = [
-            [InlineKeyboardButton("🎮 Quick Play vs AI", callback_data="quick_play")],
-            [InlineKeyboardButton("👥 Create Multiplayer Room", callback_data="create_room")],
-            [InlineKeyboardButton("📊 My Profile", callback_data="my_profile")],
-            [InlineKeyboardButton("📋 How to Play", callback_data="how_to_play")],
-            [InlineKeyboardButton("🎯 Available Commands", callback_data="show_commands")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
-            f"🎲 *Welcome to Advanced Ludo Bot, {user.first_name}!* 👑\n\n"
-            "Use the buttons below to start playing or type /help for commands list.\n\n"
-            "⚡ *Available Commands:*\n"
-            "/start - Main menu\n"
-            "/ludo - Create game room\n"  
-            "/play - Quick play vs AI\n"
-            "/roll - Roll dice\n"
-            "/board - Show game board\n"
-            "/profile - Your stats\n"
-            "/leaderboard - Top players",
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
+# Global storage for active games
+games = {}
 
-
-
-
-async def ludo_start(self, update: Update, context: CallbackContext):
-    """Create Ludo game room"""
-    user = update.effective_user
-    
-    # Create waiting room
-    room_id = game_manager.create_waiting_room(user.id, user.first_name)
-    
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start command handler"""
     keyboard = [
-        [InlineKeyboardButton("🔴 Join Red", callback_data=f"join_red_{room_id}"),
-         InlineKeyboardButton("🔵 Join Blue", callback_data=f"join_blue_{room_id}")],
-        [InlineKeyboardButton("🟡 Join Yellow", callback_data=f"join_yellow_{room_id}"),
-         InlineKeyboardButton("🟢 Join Green", callback_data=f"join_green_{room_id}")],
-        [InlineKeyboardButton("🎮 Start Game", callback_data=f"start_game_{room_id}"),
-         InlineKeyboardButton("🤖 Add AI Players", callback_data=f"add_ai_{room_id}")],
-        [InlineKeyboardButton("❌ Leave Room", callback_data=f"leave_room_{room_id}")]
+        [InlineKeyboardButton("🤖 Play vs Bot", callback_data='mode_bot')],
+        [InlineKeyboardButton("👥 2 Players", callback_data='mode_2p')],
+        [InlineKeyboardButton("👥 4 Players", callback_data='mode_4p')],
+        [InlineKeyboardButton("📖 Rules", callback_data='rules')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
-        f"🎯 *Ludo Game Room Created!*\n\n"
-        f"👤 *Room Creator:* {user.first_name}\n"
-        f"🔗 *Room ID:* `{room_id}`\n\n"
-        f"👥 *Players (1/4):*\n"
-        f"🔴 Red: {user.first_name}\n"  
-        f"🔵 Blue: Available\n"
-        f"🟡 Yellow: Available\n"
-        f"🟢 Green: Available\n\n"
-        f"Share this room ID with friends: `{room_id}`\n"
-        f"Or let them use: /join {room_id}",
+        "🎲 *Welcome to Advanced LUDO!*\n\n"
+        "Choose your game mode to start playing!\n\n"
+        "Features:\n"
+        "✅ Smart AI Bot\n"
+        "✅ Multiplayer Support\n"
+        "✅ Piece Capturing\n"
+        "✅ Safe Spots\n"
+        "✅ Extra Turn on 6",
         reply_markup=reply_markup,
         parse_mode='Markdown'
     )
 
-async def quick_play(self, update: Update, context: CallbackContext):
-    """Quick play with AI opponents"""
-    user = update.effective_user
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle all button callbacks"""
+    query = update.callback_query
+    await query.answer()
     
-    # Create game with AI players
-    room_id = game_manager.create_waiting_room(user.id, user.first_name)
+    chat_id = query.message.chat_id
+    data = query.data
     
-    # Add AI players
-    ai_players = [
-        {'id': 'ai_blue', 'name': 'Computer 2', 'color': 'blue'},
-        {'id': 'ai_green', 'name': 'Computer 3', 'color': 'green'}, 
-        {'id': 'ai_yellow', 'name': 'Computer 4', 'color': 'yellow'}
-    ]
-    
-    for ai in ai_players:
-        game_manager.join_waiting_room(room_id, ai['id'], ai['name'], ai['color'])
-    
-    # Start game immediately
-    game_id = game_manager.start_game(room_id)
-    
-    if game_id:
-        game_data = game_manager.get_game(game_id)
-        game = game_data['game']
-        
-        # Show game board
-        await self.display_game_board(update, context, game_id, user.id)
-
-async def display_game_board(self, update: Update, context: CallbackContext, game_id: str, user_id: int):
-    """Display interactive game board"""
-    game_data = game_manager.get_game(game_id)
-    if not game_data:
+    # Rules
+    if data == 'rules':
+        rules = (
+            "📖 *LUDO RULES*\n\n"
+            "🎯 *Objective:* Move all 4 pieces to finish line\n\n"
+            "🎲 *How to Play:*\n"
+            "• Roll 🎲 6 to move piece out of home\n"
+            "• Move pieces according to dice value\n"
+            "• Capture opponents by landing on them\n"
+            "• Safe spots 🛡️ protect from capture\n"
+            "• Roll 6 to get extra turn\n"
+            "• First to finish all pieces wins!\n\n"
+            "Good luck! 🍀"
+        )
+        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='back_to_menu')]]
+        await query.edit_message_text(rules, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
         return
     
-    game = game_data['game']
-    players = game_data['players']
+    # Back to menu
+    if data == 'back_to_menu':
+        keyboard = [
+            [InlineKeyboardButton("🤖 Play vs Bot", callback_data='mode_bot')],
+            [InlineKeyboardButton("👥 2 Players", callback_data='mode_2p')],
+            [InlineKeyboardButton("👥 4 Players", callback_data='mode_4p')],
+            [InlineKeyboardButton("📖 Rules", callback_data='rules')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            "🎲 *Welcome to Advanced LUDO!*\n\nChoose your game mode:",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+        return
     
-    # Create board visualization
-    board_text = self.create_board_visualization(game)
+    # Start new game
+    if data.startswith('mode_'):
+        user = query.from_user.first_name
+        
+        if data == 'mode_bot':
+            games[chat_id] = LudoGame(chat_id, [user, "🤖 Bot"], is_bot_game=True)
+        elif data == 'mode_2p':
+            games[chat_id] = LudoGame(chat_id, [user, "Player 2"])
+        elif data == 'mode_4p':
+            games[chat_id] = LudoGame(chat_id, [user, "Player 2", "Player 3", "Player 4"])
+        
+        await show_game_board(query, chat_id)
+        return
     
-    # Show whose turn it is
-    current_player_id = game.get_current_player()
-    current_player_name = players[current_player_id]['name'] if current_player_id in players else "AI"
+    # Game actions
+    if chat_id not in games:
+        await query.edit_message_text("❌ No active game! Use /start to begin.")
+        return
     
-    # Create action buttons based on turn
-    keyboard = []
-    if current_player_id == user_id:
-        keyboard.append([InlineKeyboardButton("🎲 Roll Dice", callback_data=f"roll_{game_id}")])
+    game = games[chat_id]
     
-    keyboard.append([InlineKeyboardButton("🔄 Refresh Board", callback_data=f"refresh_{game_id}")])
-    keyboard.append([InlineKeyboardButton("🏃 Leave Game", callback_data=f"leave_game_{game_id}")])
+    # Roll dice
+    if data == 'roll':
+        await handle_roll(query, chat_id)
     
+    # Move piece
+    elif data.startswith('move_'):
+        piece_idx = int(data.split('_')[1])
+        await handle_move(query, chat_id, piece_idx)
+    
+    # End turn
+    elif data == 'end_turn':
+        await handle_end_turn(query, chat_id)
+
+async def show_game_board(query, chat_id):
+    """Display the game board"""
+    game = games[chat_id]
+    keyboard = [[InlineKeyboardButton("🎲 Roll Dice", callback_data='roll')]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    message_text = (
-        f"🎲 *LUDO GAME BOARD* 🎲\n\n"
-        f"{board_text}\n\n"
-        f"🎯 *Current Turn:* {current_player_name}\n"
-        f"🎲 *Last Dice:* {game.dice_value if game.dice_value > 0 else 'Not rolled yet'}\n\n"
-        f"🕹️ *Controls:*\n"
-    )
+    text = game.get_board_display()
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+
+async def handle_roll(query, chat_id):
+    """Handle dice roll"""
+    game = games[chat_id]
+    current_player = game.get_current_player()
     
-    if hasattr(update, 'callback_query'):
-        await update.callback_query.edit_message_text(
-            message_text,
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
+    # Bot's turn
+    if game.is_bot_game and current_player == "🤖 Bot":
+        await bot_turn(query, chat_id)
+        return
+    
+    # Player rolls
+    dice = game.roll_dice()
+    movable = game.get_movable_pieces(current_player)
+    
+    text = game.get_board_display()
+    
+    # No moves available
+    if not movable:
+        text += f"\n❌ No valid moves! Turn passes."
+        keyboard = [[InlineKeyboardButton("➡️ Next Turn", callback_data='end_turn')]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        return
+    
+    # Show movable pieces
+    keyboard = []
+    for piece_idx in movable:
+        pos = game.positions[current_player][piece_idx]
+        if pos == -1:
+            label = f"🏠 Move Piece {piece_idx+1} Out"
+        else:
+            label = f"📍 Move Piece {piece_idx+1} ({pos}→{pos+dice})"
+        keyboard.append([InlineKeyboardButton(label, callback_data=f'move_{piece_idx}')])
+    
+    text += f"\n✅ Choose a piece to move:"
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+async def handle_move(query, chat_id, piece_idx):
+    """Handle piece movement"""
+    game = games[chat_id]
+    current_player = game.get_current_player()
+    
+    if game.move_piece(current_player, piece_idx):
+        # Check for winner
+        if game.winner:
+            text = f"🎉🎉🎉 *{game.winner} WINS!* 🎉🎉🎉\n\n{game.get_board_display()}"
+            keyboard = [[InlineKeyboardButton("🔄 New Game", callback_data='back_to_menu')]]
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+            del games[chat_id]
+            return
+        
+        # Extra turn on 6
+        if game.last_roll_was_six:
+            text = game.get_board_display() + "\n🎉 You rolled 6! Roll again!"
+            keyboard = [[InlineKeyboardButton("🎲 Roll Again", callback_data='roll')]]
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        else:
+            await handle_end_turn(query, chat_id)
+
+async def handle_end_turn(query, chat_id):
+    """End current turn and move to next player"""
+    game = games[chat_id]
+    game.next_turn()
+    
+    # Bot's turn
+    if game.is_bot_game and game.get_current_player() == "🤖 Bot":
+        await bot_turn(query, chat_id)
     else:
-        await update.message.reply_text(
-            message_text,
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
+        await show_game_board(query, chat_id)
 
-
-
-
-
-    def create_board_visualization(self, game):
-        """Create visual board representation"""
-        # Simple ASCII board - you can enhance this with emojis
-        board = """
-┌───────── LUDO BOARD ─────────┐
-│ 🏠●     ●     ●     ●🏠 │
-│   ● 🔴        🟢     ●   │
-│ 🏠●           ●     ●🏠 │
-│   ●     ●           ●   │
-│ 🏠●     ●  🟡     ●🏠 │
-│   ●           ●     ●   │
-│ 🏠●     ●     ●  🔵●🏠 │
-└─────────────────────────┘
-"""
-        
-        # Add player information
-        player_info = ""
-        for user_id, player_data in game.players.items():
-            color_emoji = {
-                'red': '🔴', 'blue': '🔵', 
-                'green': '🟢', 'yellow': '🟡'
-            }
-            emoji = color_emoji.get(player_data['color'], '⚫')
-            tokens_pos = game.board[player_data['color']]['tokens']
-            tokens_status = []
-            
-            for i, pos in enumerate(tokens_pos):
-                if pos == -1:
-                    tokens_status.append("HOME")
-                elif pos >= 51:
-                    tokens_status.append("SAFE")
-                else:
-                    tokens_status.append(f"POS{pos}")
-            
-            player_info += f"{emoji} {player_data['name']}: {', '.join(tokens_status[:2])}\n"
-        
-        return f"```{board}```\n\n*Player Status:*\n{player_info}"
+async def bot_turn(query, chat_id):
+    """Handle bot's turn"""
+    game = games[chat_id]
     
-    async def roll_dice_command(self, update: Update, context: CallbackContext):
-        """Handle roll dice command"""
-        user = update.effective_user
-        
-        # Find active game for user
-        game_id = None
-        for gid, game_data in game_manager.active_games.items():
-            if user.id in game_data['players']:
-                game_id = gid
-                break
-        
-        if not game_id:
-            await update.message.reply_text("❌ You are not in any active game! Use /ludo to start one.")
-            return
-        
-        await self.roll_dice_in_game(update, context, game_id, user.id)
+    # Bot rolls
+    await asyncio.sleep(1)
+    dice = game.roll_dice()
     
-    async def roll_dice_in_game(self, update: Update, context: CallbackContext, game_id: str, user_id: int):
-        """Roll dice in specific game"""
-        game_data = game_manager.get_game(game_id)
-        if not game_data:
-            return
-        
-        game = game_data['game']
-        
-        # Check if it's user's turn
-        if game.get_current_player() != user_id:
-            await update.message.reply_text("❌ It's not your turn!")
-            return
-        
-        # Roll dice
-        dice_value = game.roll_dice()
-        dice_emojis = {1: "⚀", 2: "⚁", 3: "⚂", 4: "⚃", 5: "⚄", 6: "⚅"}
-        
-        # Send dice animation
-        if hasattr(update, 'callback_query'):
-            msg = update.callback_query.message
-            rolling_msg = await msg.edit_text("🎲 Rolling dice...")
-        else:
-            rolling_msg = await update.message.reply_text("🎲 Rolling dice...")
-        
-        # Simulate rolling animation
+    text = game.get_board_display() + f"\n🤖 Bot rolled {dice}..."
+    await query.edit_message_text(text, parse_mode='Markdown')
+    await asyncio.sleep(1.5)
+    
+    # Bot makes move
+    piece_idx = game.bot_make_move()
+    
+    if piece_idx is None:
+        text = game.get_board_display() + "\n🤖 Bot has no valid moves!"
+        await query.edit_message_text(text, parse_mode='Markdown')
         await asyncio.sleep(1)
-        
-        # Check for available moves
-        player_color = game_data['players'][user_id]['color']
-        available_moves = []
-        
-        for i in range(4):
-            if game.can_move_token(player_color, i):
-                available_moves.append(i)
-        
-        # Create move buttons if moves available
-        keyboard = []
-        if available_moves:
-            move_buttons = []
-            for move_idx in available_moves:
-                move_buttons.append(InlineKeyboardButton(
-                    f"Token {move_idx + 1}", 
-                    callback_data=f"move_{game_id}_{move_idx}"
-                ))
-            keyboard.append(move_buttons)
-        
-        keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh_{game_id}")])
-        
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        message_text = (
-            f"🎲 *Dice Rolled!* {dice_emojis[dice_value]} **{dice_value}**\n\n"
-        )
-        
-        if dice_value == 6:
-            message_text += "🎉 *Lucky 6!* You get an extra turn!\n\n"
-        
-        if available_moves:
-            message_text += "✅ *Available Moves:* Select a token to move:"
-        else:
-            message_text += "❌ *No moves available.* Turn passes to next player."
-            # Auto proceed to next turn if no moves
-            game.next_turn()
-        
-        if hasattr(update, 'callback_query'):
-            await update.callback_query.edit_message_text(
-                message_text,
-                reply_markup=reply_markup,
-                parse_mode='Markdown'
-            )
-        else:
-            await rolling_msg.edit_text(
-                message_text,
-                reply_markup=reply_markup,
-                parse_mode='Markdown'
-            )
-
-
-
-
-
-
-    async def button_handler(self, update: Update, context: CallbackContext):
-        """Handle all button clicks"""
-        query = update.callback_query
-        await query.answer()
-        
-        data = query.data
-        user = query.from_user
-        
-        # Join room buttons
-        if data.startswith("join_"):
-            parts = data.split("_")
-            if len(parts) == 3:
-                color = parts[1]
-                room_id = parts[2]
-                
-                success = game_manager.join_waiting_room(
-                    room_id, user.id, user.first_name, color
-                )
-                
-                if success:
-                    room = game_manager.get_waiting_room(room_id)
-                    
-                    # Update room display
-                    players_text = ""
-                    for player_id, player_data in room['players'].items():
-                        color_emoji = {
-                            'red': '🔴', 'blue': '🔵', 
-                            'green': '🟢', 'yellow': '🟡'
-                        }
-                        emoji = color_emoji.get(player_data['color'], '⚫')
-                        players_text += f"{emoji} {player_data['name']}\n"
-                    
-                    keyboard = [
-                        [InlineKeyboardButton("🔴 Join Red", callback_data=f"join_red_{room_id}"),
-                         InlineKeyboardButton("🔵 Join Blue", callback_data=f"join_blue_{room_id}")],
-                        [InlineKeyboardButton("🟡 Join Yellow", callback_data=f"join_yellow_{room_id}"),
-                         InlineKeyboardButton("🟢 Join Green", callback_data=f"join_green_{room_id}")],
-                        [InlineKeyboardButton("🎮 Start Game", callback_data=f"start_game_{room_id}"),
-                         InlineKeyboardButton("🤖 Add AI Players", callback_data=f"add_ai_{room_id}")],
-                        [InlineKeyboardButton("❌ Leave Room", callback_data=f"leave_room_{room_id}")]
-                    ]
-                    reply_markup = InlineKeyboardMarkup(keyboard)
-                    
-                    await query.edit_message_text(
-                        f"🎯 *Ludo Game Room*\n\n"
-                        f"👥 *Players ({len(room['players'])}/4):*\n{players_text}\n"
-                        f"Share room ID: `{room_id}`",
-                        reply_markup=reply_markup,
-                        parse_mode='Markdown'
-                    )
-                else:
-                    await query.edit_message_text("❌ Could not join room. It might be full!")
-        
-        # Start game button
-        elif data.startswith("start_game_"):
-            room_id = data.split("_")[2]
-            room = game_manager.get_waiting_room(room_id)
-            
-            if room and room['creator'] == user.id:
-                game_id = game_manager.start_game(room_id)
-                if game_id:
-                    await self.display_game_board(query, context, game_id, user.id)
-        
-        # Roll dice button
-        elif data.startswith("roll_"):
-            game_id = data.split("_")[1]
-            await self.roll_dice_in_game(query, context, game_id, user.id)
-        
-        # Move token button
-        elif data.startswith("move_"):
-            parts = data.split("_")
-            game_id = parts[1]
-            token_index = int(parts[2])
-            
-            game_data = game_manager.get_game(game_id)
-            if game_data and user.id in game_data['players']:
-                game = game_data['game']
-                player_color = game_data['players'][user.id]['color']
-                
-                # Move token
-                extra_turn = game.move_token(player_color, token_index)
-                
-                # Check for winner
-                winner_id = game.check_winner()
-                if winner_id:
-                    winner_name = game_data['players'][winner_id]['name']
-                    await query.edit_message_text(
-                        f"🎉 *GAME OVER!* 🎉\n\n"
-                        f"🏆 **{winner_name} WINS!** 🏆\n\n"
-                        f"Thanks for playing! Use /ludo to start a new game.",
-                        parse_mode='Markdown'
-                    )
-                    # Clean up game
-                    if game_id in game_manager.active_games:
-                        del game_manager.active_games[game_id]
-                    return
-                
-                # Move to next turn if no extra turn
-                if not extra_turn:
-                    game.next_turn()
-                
-                # Refresh board
-                await self.display_game_board(query, context, game_id, user.id)
-        
-        # Refresh board button
-        elif data.startswith("refresh_"):
-            game_id = data.split("_")[1]
-            await self.display_game_board(query, context, game_id, user.id)
-        
-        # Quick play button
-        elif data == "quick_play":
-            await self.quick_play(query, context)
-        
-        # Show commands button
-        elif data == "show_commands":
-            await self.show_commands(query, context)
-        
-        # How to play button
-        elif data == "how_to_play":
-            await query.edit_message_text(
-                "📋 *Ludo Game Rules:*\n\n"
-                "🎯 *Objective:*\nGet all 4 tokens to home first!\n\n"
-                "🎲 *Gameplay:*\n"
-                "• Roll dice with /roll or button\n"
-                "• Move tokens around board\n"
-                "• Get 6 for extra turn\n"
-                "• Capture opponent tokens\n"
-                "• Reach home path to win\n\n"
-                "🏆 *Winning:*\nFirst to get all tokens home wins!\n\n"
-                "💡 *Tips:*\n"
-                "• Use 6 to bring out new tokens\n"
-                "• Block opponents when possible\n"
-                "• Safe zones protect your tokens",
-                parse_mode='Markdown'
-            )
+        game.next_turn()
+        await show_game_board(query, chat_id)
+        return
     
-    async def show_commands(self, update: Update, context: CallbackContext):
-        """Show available commands"""
-        commands_text = """
-🎲 *LUDO BOT COMMANDS* 🎲
-
-*🎮 Game Commands:*
-/start - Main menu with buttons
-/ludo - Create multiplayer room  
-/play - Quick play vs AI
-/roll - Roll dice (in game)
-/board - Show game board
-/profile - Your player stats
-/leaderboard - Top players
-
-*👥 Multiplayer:*
-• Use /ludo to create room
-• Share room ID with friends
-• Join via buttons or /join <room_id>
-
-*🕹️ How to Play:*
-1. Use /ludo or /play to start
-2. Roll dice when it's your turn
-3. Move tokens around board
-4. Capture opponent tokens
-5. First to home all tokens wins!
-
-*⚡ Features:*
-• Interactive board
-• Real-time gameplay
-• AI opponents  
-• Player statistics
-• Multiplayer rooms
-        """
-        
-        if hasattr(update, 'callback_query'):
-            await update.callback_query.edit_message_text(
-                commands_text,
-                parse_mode='Markdown'
-            )
-        else:
-            await update.message.reply_text(
-                commands_text,
-                parse_mode='Markdown'
-            )
-
-
-
-
-
-    async def show_board(self, update: Update, context: CallbackContext):
-        """Show game board command"""
-        user = update.effective_user
-        
-        # Find active game for user
-        game_id = None
-        for gid, game_data in game_manager.active_games.items():
-            if user.id in game_data['players']:
-                game_id = gid
-                break
-        
-        if game_id:
-            await self.display_game_board(update, context, game_id, user.id)
-        else:
-            await update.message.reply_text("❌ You are not in any active game! Use /ludo to start one.")
-
-    async def profile_command(self, update: Update, context: CallbackContext):
-        """Show user profile with stats"""
-        user = update.effective_user
-        conn = sqlite3.connect('ludo_bot.db')
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT games_played, games_won, total_coins FROM users WHERE user_id = ?
-        ''', (user.id,))
-        
-        result = cursor.fetchone()
-        conn.close()
-        
-        if result:
-            games_played, games_won, total_coins = result
-            win_rate = (games_won / games_played * 100) if games_played > 0 else 0
-            
-            profile_text = f"""
-📊 *Player Profile:* {user.first_name}
-
-🎮 *Statistics:*
-• Games Played: {games_played}
-• Games Won: {games_won}
-• Win Rate: {win_rate:.1f}%
-• Total Coins: 🪙 {total_coins}
-
-🏆 *Achievements:*
-{'🥇 Ludo Master' if games_won >= 10 else '🎯 Beginner'}
-{'💰 Rich Player' if total_coins >= 5000 else '💸 New Player'}
-
-🌟 *Keep playing to unlock more features!*
-            """
-        else:
-            profile_text = "📊 *Profile not found!* Use /start to create your profile."
-        
-        await update.message.reply_text(profile_text, parse_mode='Markdown')
+    game.move_piece("🤖 Bot", piece_idx)
     
-    async def leaderboard_command(self, update: Update, context: CallbackContext):
-        """Show global leaderboard"""
-        conn = sqlite3.connect('ludo_bot.db')
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT username, games_won, total_coins 
-            FROM users 
-            WHERE games_played > 0 
-            ORDER BY games_won DESC, total_coins DESC 
-            LIMIT 10
-        ''')
-        
-        top_players = cursor.fetchall()
-        conn.close()
-        
-        leaderboard_text = "🏆 *Global Leaderboard*\n\n"
-        
-        for idx, (username, wins, coins) in enumerate(top_players, 1):
-            medal = "🥇" if idx == 1 else "🥈" if idx == 2 else "🥉" if idx == 3 else f"{idx}."
-            name = username if username else "Anonymous"
-            leaderboard_text += f"{medal} {name}\n   🏅 {wins} wins | 🪙 {coins} coins\n\n"
-        
-        if not top_players:
-            leaderboard_text += "No players yet! Be the first to play! 🎮"
-        
-        await update.message.reply_text(leaderboard_text, parse_mode='Markdown')
+    # Check winner
+    if game.winner:
+        text = f"🎉 *{game.winner} WINS!*\n\n{game.get_board_display()}"
+        keyboard = [[InlineKeyboardButton("🔄 New Game", callback_data='back_to_menu')]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        del games[chat_id]
+        return
     
-    async def help_command(self, update: Update, context: CallbackContext):
-        """Help command"""
-        await self.show_commands(update, context)
+    # Bot got 6, rolls again
+    if game.last_roll_was_six:
+        text = game.get_board_display() + "\n🤖 Bot rolled 6! Rolling again..."
+        await query.edit_message_text(text, parse_mode='Markdown')
+        await asyncio.sleep(1)
+        await bot_turn(query, chat_id)
+    else:
+        game.next_turn()
+        await show_game_board(query, chat_id)
+
+def main():
+    """Start the bot"""
+    app = Application.builder().token(TOKEN).build()
     
-    def run(self):
-        """Start the bot"""
-        print("🤖 Advanced Ludo Bot Starting...")
-        print("🎲 Features: Interactive Board, Multiplayer, AI Opponents")
-        print("🚀 Bot is ready!")
-        self.application.run_polling()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    
+    print("🎲 Ludo Bot Started Successfully!")
+    print(f"✅ Bot Token: {TOKEN[:20]}...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-def run_flask():
-    """Run Flask server in separate thread"""
-    app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False)
-
-# Start Flask server
-flask_thread = threading.Thread(target=run_flask)
-flask_thread.daemon = True
-flask_thread.start()
-
-# Start the bot
-if __name__ == "__main__":
-    bot = AdvancedLudoBot(BOT_TOKEN)
-    bot.run()
+if __name__ == '__main__':
+    main()
